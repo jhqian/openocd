@@ -45,6 +45,11 @@ jobs:
     name: Build Linux (x86_64, glibc 2.36)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The debian:12 container falls back to sh (dash) as the default step
+    # shell, which rejects bash-only syntax like "set -o pipefail".
+    defaults:
+      run:
+        shell: bash
     container:
       image: debian:12
     env:
@@ -278,6 +283,7 @@ jobs:
       - name: Assert only Windows system DLLs are imported
         run: |
           set -e
+          cd $BUILD_DIR
           # cross-build.sh runs under "set -x", so its log records the
           # DESTDIR of the second (openocd-only) install. Recover that
           # path instead of guessing the directory name. The
