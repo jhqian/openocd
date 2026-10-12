@@ -92,7 +92,11 @@ jobs:
             configure.ac > configure.ac.tmp
           mv configure.ac.tmp configure.ac
           ./bootstrap
-          ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared --disable-testgui
+          # PKG_CHECK_MODULES(libusb-1.0) is an unconditional fatal check in
+          # hidapi's Linux backend even when only hidraw is built; point it
+          # at the static libusb installed in the release prefix.
+          ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared --disable-testgui \
+            PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig"
           make -j$(nproc)
           make install
 
@@ -274,10 +278,20 @@ jobs:
       - name: Assert only Windows system DLLs are imported
         run: |
           set -e
-          # cross-build.sh installs a clean openocd-only tree under
-          # openocd_<tag>_<host>/ (bin/../share/openocd/scripts layout must
-          # be preserved for the script search relocation in options.c).
-          OPENOCD_EXE=$(ls $BUILD_DIR/openocd-*_${HOST}/usr/bin/openocd.exe)
+          # cross-build.sh runs under "set -x", so its log records the
+          # DESTDIR of the second (openocd-only) install. Recover that
+          # path instead of guessing the directory name. The
+          # bin/../share/openocd/scripts layout must be preserved for the
+          # script search relocation in options.c.
+          PACKAGE_DIR=$(grep -oP 'install-strip DESTDIR=\K\S+' cross-build.log | tail -1)
+          if [ -z "$PACKAGE_DIR" ] || [ ! -f "$PACKAGE_DIR/usr/bin/openocd.exe" ]; then
+            echo "Could not locate the openocd-only install tree:"
+            grep "install-strip DESTDIR" cross-build.log || true
+            ls -la $BUILD_DIR/ || true
+            find $BUILD_DIR -maxdepth 2 -name 'openocd.exe' 2>/dev/null || true
+            exit 1
+          fi
+          OPENOCD_EXE=$PACKAGE_DIR/usr/bin/openocd.exe
           echo "Checking $OPENOCD_EXE"
           DLLS=$(i686-w64-mingw32-objdump -p "$OPENOCD_EXE" \
             | grep "DLL Name" | sed 's/.*DLL Name: //' | tr '[:upper:]' '[:lower:]' | sort -u)
@@ -298,7 +312,10 @@ jobs:
 
       - name: Create Windows package
         run: |
-          cd $BUILD_DIR/openocd-*_${HOST}/usr
+          set -e
+          cd $BUILD_DIR
+          PACKAGE_DIR=$(grep -oP 'install-strip DESTDIR=\K\S+' cross-build.log | tail -1)
+          cd "$PACKAGE_DIR/usr"
           ARTIFACT="openocd-windows-i686.zip"
           zip -r $ARTIFACT *
           mv $ARTIFACT $GITHUB_WORKSPACE/
