@@ -1,0 +1,619 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# GitHub Release workflow for building OpenOCD on Windows, Linux, and macOS.
+#
+# Static linking policy (priority order):
+#   - Windows: fully static openocd.exe, only Windows system DLLs allowed
+#   - Linux/macOS: libusb and hidapi linked statically, only system libraries
+#     remain dynamic (glibc/libudev on Linux, system frameworks on macOS)
+#
+# Required probe support asserted after configure: FT2232 (MPSSE), cJTAG
+# (OScan1/JScan3), CMSIS-DAP v1 (HID) and v2 (USB bulk). A configure-time
+# adapter silently disabled by an auto probe failure fails the build instead
+# of shipping a broken binary.
+#
+# Baselines: Linux glibc 2.36 (debian:12 container), macOS 11.0.
+
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'hpm_xpi_v*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LIBUSB_VER: 1.0.24
+  LIBUSB_URL: https://github.com/libusb/libusb/releases/download/v1.0.24/libusb-1.0.24.tar.bz2
+  LIBUSB_SHA256: 7efd2685f7b327326dcfb85cee426d9b871fd70e22caa15bb68d595ce2a2b12a
+  HIDAPI_VER: 0.10.1
+  HIDAPI_URL: https://github.com/libusb/hidapi/archive/hidapi-0.10.1.tar.gz
+  HIDAPI_SHA256: f71dd8a1f46979c17ee521bc2117573872bbf040f8a4750e492271fc141f2644
+  CAPSTONE_VER: 4.0.2
+  CAPSTONE_URL: https://github.com/capstone-engine/capstone/archive/refs/tags/4.0.2.tar.gz
+  CAPSTONE_SHA256: 7c81d798022f81e7507f1a60d6817f63aa76e489aa4e7055255f21a22f5e526a
+  JIMTCL_VER: "0.83"
+  JIMTCL_URL: https://github.com/msteveb/jimtcl/archive/refs/tags/0.83.tar.gz
+  JIMTCL_SHA256: 6f2df00009f5ac4ad654c1ae1d2f8ed18191de38d1f5a88a54ea99cc16936686
+
+jobs:
+  build-linux:
+    name: Build Linux (x86_64, glibc 2.36)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: debian:12
+    env:
+      DEPS_PREFIX: /tmp/openocd-deps
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git \
+            build-essential \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            texinfo \
+            libudev-dev \
+            ca-certificates \
+            curl
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build static libusb (udev backend disabled, sysfs enumeration)
+        run: |
+          curl -sSfL -o libusb.tar.bz2 "${LIBUSB_URL}"
+          echo "${LIBUSB_SHA256}  libusb.tar.bz2" | sha256sum -c -
+          tar -xjf libusb.tar.bz2
+          cd libusb-${LIBUSB_VER}
+          ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared --disable-udev
+          make -j$(nproc)
+          make install
+
+      - name: Build static hidapi (hidraw backend)
+        run: |
+          curl -sSfL -o hidapi.tar.gz "${HIDAPI_URL}"
+          echo "${HIDAPI_SHA256}  hidapi.tar.gz" | sha256sum -c -
+          tar -xzf hidapi.tar.gz
+          cd hidapi-hidapi-${HIDAPI_VER}
+          # hidapi 0.10.1 ships duplicate AC_CONFIG_MACRO_DIR lines in
+          # configure.ac, which breaks autoreconf on modern automake.
+          awk 'BEGIN{seen=0} /^AC_CONFIG_MACRO_DIR/ {if(seen==0) {print; seen=1} next} {print}' \
+            configure.ac > configure.ac.tmp
+          mv configure.ac.tmp configure.ac
+          ./bootstrap
+          ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared --disable-testgui
+          make -j$(nproc)
+          make install
+
+      - name: Bootstrap
+        run: ./bootstrap nosubmodule
+
+      - name: Configure
+        run: |
+          # pipefail: the default GitHub Actions shell (bash -e) would let
+          # tee mask a configure failure.
+          set -eo pipefail
+          # LIBS appends -ludev explicitly: hidapi-hidraw.pc lacks
+          # "Libs.private: -ludev", so pkg-config --static does not
+          # propagate it and the CMSIS-DAP v1 (HID) link test would
+          # silently disable the adapter.
+          ./configure \
+            --enable-internal-jimtcl \
+            --disable-werror \
+            --enable-remote-bitbang \
+            --enable-jtag_vpi \
+            --without-capstone \
+            --prefix=/usr/local \
+            --enable-static \
+            --disable-shared \
+            PKG_CONFIG="pkg-config --static" \
+            PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig" \
+            CPPFLAGS="-I${DEPS_PREFIX}/include" \
+            LDFLAGS="-L${DEPS_PREFIX}/lib" \
+            LIBS="-ludev" \
+            2>&1 | tee configure.log
+
+      - name: Assert required adapters are enabled
+        run: |
+          set -e
+          grep -E "^MPSSE mode of FTDI based devices +yes" configure.log
+          grep -E "^CMSIS-DAP v2 compliant dongle \(USB bulk\) +yes" configure.log
+          grep -E "^CMSIS-DAP v1 compliant dongle \(HID\) +yes" configure.log
+          grep -E "^cJTAG \(OScan1, JScan3\) tunneled thru MPSSE +yes" configure.log
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Install to staging directory
+        run: |
+          mkdir -p staging
+          make install-strip DESTDIR=$(pwd)/staging
+
+      - name: Assert no third-party dynamic dependencies
+        run: |
+          # Expected dynamic deps: the dynamic loader, glibc, and libudev
+          # (pulled in by the hidapi hidraw backend). Anything else means a
+          # dependency silently fell back to dynamic linking.
+          UNEXPECTED=$(ldd staging/usr/local/bin/openocd \
+            | grep -vE "linux-vdso|ld-linux-x86-64|libc\.so\.6|libudev\.so\.1|libm\.so\.6" || true)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Unexpected dynamic dependencies:"
+            echo "$UNEXPECTED"
+            exit 1
+          fi
+          ldd staging/usr/local/bin/openocd
+
+      - name: Create tarball
+        run: |
+          cd staging
+          tar -czf ../openocd-linux-x86_64.tar.gz usr/
+          cd ..
+          sha256sum openocd-linux-x86_64.tar.gz > openocd-linux-x86_64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-linux-x86_64
+          path: |
+            openocd-linux-x86_64.tar.gz
+            openocd-linux-x86_64.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (i686)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DL_DIR: ../downloads
+      BUILD_DIR: ../build
+      HOST: i686-w64-mingw32
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autotools-dev \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            texinfo \
+            g++-mingw-w64-i686 \
+            gcc-mingw-w64-i686
+
+      - name: Bootstrap
+        run: ./bootstrap
+
+      - name: Prepare libusb1
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          curl -sSfL -o libusb.tar.bz2 "${LIBUSB_URL}"
+          echo "${LIBUSB_SHA256}  libusb.tar.bz2" | sha256sum -c -
+          tar -xjf libusb.tar.bz2
+          echo "LIBUSB1_SRC=$PWD/libusb-${LIBUSB_VER}" >> $GITHUB_ENV
+
+      - name: Prepare hidapi
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          curl -sSfL -o hidapi.tar.gz "${HIDAPI_URL}"
+          echo "${HIDAPI_SHA256}  hidapi.tar.gz" | sha256sum -c -
+          tar -xzf hidapi.tar.gz
+          cd hidapi-hidapi-${HIDAPI_VER}
+          # hidapi 0.10.1 ships duplicate AC_CONFIG_MACRO_DIR lines in
+          # configure.ac, which breaks autoreconf on modern automake.
+          awk 'BEGIN{seen=0} /^AC_CONFIG_MACRO_DIR/ {if(seen==0) {print; seen=1} next} {print}' \
+            configure.ac > configure.ac.tmp
+          mv configure.ac.tmp configure.ac
+          ./bootstrap
+          echo "HIDAPI_SRC=$PWD" >> $GITHUB_ENV
+
+      - name: Prepare capstone
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          curl -sSfL -o capstone.tar.gz "${CAPSTONE_URL}"
+          echo "${CAPSTONE_SHA256}  capstone.tar.gz" | sha256sum -c -
+          tar -xzf capstone.tar.gz
+          echo "CAPSTONE_SRC=$PWD/capstone-${CAPSTONE_VER}" >> $GITHUB_ENV
+
+      - name: Prepare jimtcl
+        run: |
+          mkdir -p $DL_DIR && cd $DL_DIR
+          curl -sSfL -o jimtcl.tar.gz "${JIMTCL_URL}"
+          echo "${JIMTCL_SHA256}  jimtcl.tar.gz" | sha256sum -c -
+          tar -xzf jimtcl.tar.gz
+          echo "JIMTCL_SRC=$PWD/jimtcl-${JIMTCL_VER}" >> $GITHUB_ENV
+
+      - name: Cross-build OpenOCD for Windows
+        env:
+          MAKE_JOBS: 2
+          LIBUSB1_CONFIG: --enable-static --disable-shared
+          HIDAPI_CONFIG: --enable-static --disable-shared --disable-testgui
+          CAPSTONE_CONFIG: CAPSTONE_BUILD_CORE_ONLY=yes CAPSTONE_STATIC=yes CAPSTONE_SHARED=no
+          JIMTCL_CONFIG: --with-ext=json --minimal --disable-ssl
+          OPENOCD_CONFIG: "--disable-werror --enable-static --disable-shared"
+          # -static is what matters: it forces libgcc and winpthread to be
+          # linked from the static archives. Library-order tricks in LDFLAGS
+          # are ineffective because LDFLAGS precedes object files on the
+          # link command line.
+          LDFLAGS: "-static"
+        run: |
+          set -eo pipefail
+          OPENOCD_TAG=$(git tag --points-at HEAD | head -n1)
+          [ -z "$OPENOCD_TAG" ] && OPENOCD_TAG=$(git rev-parse --short HEAD)
+          export OPENOCD_TAG
+          export OPENOCD_SRC=$PWD
+          mkdir -p $BUILD_DIR && cd $BUILD_DIR
+          bash $OPENOCD_SRC/contrib/cross-build.sh $HOST 2>&1 | tee cross-build.log
+
+      - name: Assert required adapters are enabled
+        run: |
+          set -e
+          cd $BUILD_DIR
+          grep -E "^MPSSE mode of FTDI based devices +yes" cross-build.log
+          grep -E "^CMSIS-DAP v2 compliant dongle \(USB bulk\) +yes" cross-build.log
+          grep -E "^CMSIS-DAP v1 compliant dongle \(HID\) +yes" cross-build.log
+          grep -E "^cJTAG \(OScan1, JScan3\) tunneled thru MPSSE +yes" cross-build.log
+
+      - name: Assert only Windows system DLLs are imported
+        run: |
+          set -e
+          # cross-build.sh installs a clean openocd-only tree under
+          # openocd_<tag>_<host>/ (bin/../share/openocd/scripts layout must
+          # be preserved for the script search relocation in options.c).
+          OPENOCD_EXE=$(ls $BUILD_DIR/openocd-*_${HOST}/usr/bin/openocd.exe)
+          echo "Checking $OPENOCD_EXE"
+          DLLS=$(i686-w64-mingw32-objdump -p "$OPENOCD_EXE" \
+            | grep "DLL Name" | sed 's/.*DLL Name: //' | tr '[:upper:]' '[:lower:]' | sort -u)
+          if [ -z "$DLLS" ]; then
+            echo "Failed to read import table"
+            exit 1
+          fi
+          ALLOWED="kernel32.dll msvcrt.dll ws2_32.dll setupapi.dll advapi32.dll shell32.dll user32.dll hid.dll ole32.dll"
+          STATUS=0
+          for d in $DLLS; do
+            echo "Import: $d"
+            case " $ALLOWED " in
+              *" $d "*) ;;
+              *) echo "ERROR: unexpected DLL import: $d"; STATUS=1;;
+            esac
+          done
+          exit $STATUS
+
+      - name: Create Windows package
+        run: |
+          cd $BUILD_DIR/openocd-*_${HOST}/usr
+          ARTIFACT="openocd-windows-i686.zip"
+          zip -r $ARTIFACT *
+          mv $ARTIFACT $GITHUB_WORKSPACE/
+          cd $GITHUB_WORKSPACE
+          sha256sum openocd-windows-i686.zip > openocd-windows-i686.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-windows-i686
+          path: |
+            openocd-windows-i686.zip
+            openocd-windows-i686.zip.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  build-macos-arm64:
+    name: Build macOS (arm64)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      DEPS_PREFIX: /tmp/openocd-deps
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Assert runner architecture
+        run: |
+          test "$(uname -m)" = "arm64" || { echo "Expected arm64 runner, got $(uname -m)"; exit 1; }
+
+      - name: Install build tools
+        run: |
+          brew install autoconf automake libtool pkg-config texinfo
+
+      - name: Build static libusb
+        run: |
+          curl -sSfL -o libusb.tar.bz2 "${LIBUSB_URL}"
+          echo "${LIBUSB_SHA256}  libusb.tar.bz2" | shasum -a 256 -c -
+          tar -xjf libusb.tar.bz2
+          cd libusb-${LIBUSB_VER}
+          ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared
+          make -j$(sysctl -n hw.ncpu)
+          make install
+
+      - name: Build static hidapi
+        run: |
+          curl -sSfL -o hidapi.tar.gz "${HIDAPI_URL}"
+          echo "${HIDAPI_SHA256}  hidapi.tar.gz" | shasum -a 256 -c -
+          tar -xzf hidapi.tar.gz
+          cd hidapi-hidapi-${HIDAPI_VER}
+          # hidapi 0.10.1 ships duplicate AC_CONFIG_MACRO_DIR lines in
+          # configure.ac, which breaks autoreconf on modern automake.
+          awk 'BEGIN{seen=0} /^AC_CONFIG_MACRO_DIR/ {if(seen==0) {print; seen=1} next} {print}' \
+            configure.ac > configure.ac.tmp
+          mv configure.ac.tmp configure.ac
+          ./bootstrap
+          ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared --disable-testgui
+          make -j$(sysctl -n hw.ncpu)
+          make install
+
+      - name: Bootstrap
+        run: ./bootstrap nosubmodule
+
+      - name: Configure
+        run: |
+          set -eo pipefail
+          ./configure \
+            --enable-internal-jimtcl \
+            --disable-werror \
+            --enable-remote-bitbang \
+            --enable-jtag_vpi \
+            --without-capstone \
+            --prefix=/usr/local \
+            --enable-static \
+            --disable-shared \
+            PKG_CONFIG="pkg-config --static" \
+            PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig" \
+            CPPFLAGS="-I${DEPS_PREFIX}/include" \
+            LDFLAGS="-L${DEPS_PREFIX}/lib" \
+            2>&1 | tee configure.log
+
+      - name: Assert required adapters are enabled
+        run: |
+          set -e
+          grep -E "^MPSSE mode of FTDI based devices +yes" configure.log
+          grep -E "^CMSIS-DAP v2 compliant dongle \(USB bulk\) +yes" configure.log
+          grep -E "^CMSIS-DAP v1 compliant dongle \(HID\) +yes" configure.log
+          grep -E "^cJTAG \(OScan1, JScan3\) tunneled thru MPSSE +yes" configure.log
+
+      - name: Build
+        run: make -j$(sysctl -n hw.ncpu)
+
+      - name: Install to staging directory
+        run: |
+          mkdir -p staging
+          make install-strip DESTDIR=$(pwd)/staging
+
+      - name: Assert no third-party dynamic dependencies
+        run: |
+          # Expected dynamic deps: system frameworks and libSystem only.
+          # The release prefix contains only static archives, so a stray
+          # .dylib dependency means something linked against the runner's
+          # Homebrew or SDK in an unplanned way.
+          UNEXPECTED=$(otool -L staging/usr/local/bin/openocd | tail -n +2 \
+            | grep -vE "/usr/lib/|/System/Library/" || true)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Unexpected dynamic dependencies:"
+            echo "$UNEXPECTED"
+            exit 1
+          fi
+          otool -L staging/usr/local/bin/openocd
+
+      - name: Create tarball
+        run: |
+          cd staging
+          tar -czf ../openocd-macos-arm64.tar.gz usr/
+          cd ..
+          shasum -a 256 openocd-macos-arm64.tar.gz > openocd-macos-arm64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-macos-arm64
+          path: |
+            openocd-macos-arm64.tar.gz
+            openocd-macos-arm64.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  build-macos-x86_64:
+    name: Build macOS (x86_64)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      DEPS_PREFIX: /tmp/openocd-deps
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Assert runner architecture and Rosetta availability
+        run: |
+          set -e
+          # GitHub no longer provides x86_64 macOS runners; x86_64 builds
+          # cross-compile through Rosetta on an arm64 runner. Install
+          # Rosetta idempotently if the image does not ship it.
+          test "$(uname -m)" = "arm64" || { echo "Expected arm64 runner, got $(uname -m)"; exit 1; }
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          arch -x86_64 /usr/bin/true
+
+      - name: Install build tools
+        run: |
+          brew install autoconf automake libtool pkg-config texinfo
+
+      - name: Build static libusb (x86_64 via Rosetta)
+        run: |
+          curl -sSfL -o libusb.tar.bz2 "${LIBUSB_URL}"
+          echo "${LIBUSB_SHA256}  libusb.tar.bz2" | shasum -a 256 -c -
+          tar -xjf libusb.tar.bz2
+          cd libusb-${LIBUSB_VER}
+          arch -x86_64 ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared CC="arch -x86_64 gcc"
+          arch -x86_64 make -j$(sysctl -n hw.ncpu)
+          arch -x86_64 make install
+
+      - name: Build static hidapi (x86_64 via Rosetta)
+        run: |
+          curl -sSfL -o hidapi.tar.gz "${HIDAPI_URL}"
+          echo "${HIDAPI_SHA256}  hidapi.tar.gz" | shasum -a 256 -c -
+          tar -xzf hidapi.tar.gz
+          cd hidapi-hidapi-${HIDAPI_VER}
+          # hidapi 0.10.1 ships duplicate AC_CONFIG_MACRO_DIR lines in
+          # configure.ac, which breaks autoreconf on modern automake.
+          awk 'BEGIN{seen=0} /^AC_CONFIG_MACRO_DIR/ {if(seen==0) {print; seen=1} next} {print}' \
+            configure.ac > configure.ac.tmp
+          mv configure.ac.tmp configure.ac
+          ./bootstrap
+          arch -x86_64 ./configure --prefix=${DEPS_PREFIX} --enable-static --disable-shared --disable-testgui CC="arch -x86_64 gcc"
+          arch -x86_64 make -j$(sysctl -n hw.ncpu)
+          arch -x86_64 make install
+
+      - name: Bootstrap
+        run: ./bootstrap
+
+      - name: Configure (x86_64)
+        run: |
+          set -eo pipefail
+          arch -x86_64 ./configure \
+            --enable-internal-jimtcl \
+            --disable-werror \
+            --enable-remote-bitbang \
+            --enable-jtag_vpi \
+            --without-capstone \
+            --prefix=/usr/local \
+            --enable-static \
+            --disable-shared \
+            CC="arch -x86_64 gcc" \
+            PKG_CONFIG="pkg-config --static" \
+            PKG_CONFIG_PATH="${DEPS_PREFIX}/lib/pkgconfig" \
+            CPPFLAGS="-I${DEPS_PREFIX}/include" \
+            LDFLAGS="-L${DEPS_PREFIX}/lib" \
+            2>&1 | tee configure.log
+
+      - name: Assert required adapters are enabled
+        run: |
+          set -e
+          grep -E "^MPSSE mode of FTDI based devices +yes" configure.log
+          grep -E "^CMSIS-DAP v2 compliant dongle \(USB bulk\) +yes" configure.log
+          grep -E "^CMSIS-DAP v1 compliant dongle \(HID\) +yes" configure.log
+          grep -E "^cJTAG \(OScan1, JScan3\) tunneled thru MPSSE +yes" configure.log
+
+      - name: Build (x86_64)
+        run: arch -x86_64 make -j$(sysctl -n hw.ncpu)
+
+      - name: Install to staging directory
+        run: |
+          mkdir -p staging
+          arch -x86_64 make install-strip DESTDIR=$(pwd)/staging
+
+      - name: Assert no third-party dynamic dependencies
+        run: |
+          UNEXPECTED=$(otool -L staging/usr/local/bin/openocd | tail -n +2 \
+            | grep -vE "/usr/lib/|/System/Library/" || true)
+          if [ -n "$UNEXPECTED" ]; then
+            echo "Unexpected dynamic dependencies:"
+            echo "$UNEXPECTED"
+            exit 1
+          fi
+          otool -L staging/usr/local/bin/openocd
+
+      - name: Create tarball
+        run: |
+          cd staging
+          tar -czf ../openocd-macos-x86_64.tar.gz usr/
+          cd ..
+          shasum -a 256 openocd-macos-x86_64.tar.gz > openocd-macos-x86_64.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openocd-macos-x86_64
+          path: |
+            openocd-macos-x86_64.tar.gz
+            openocd-macos-x86_64.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  create-release:
+    name: Create Release
+    needs: [build-linux, build-windows, build-macos-arm64, build-macos-x86_64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Get tag name
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" =~ ^refs/tags/(.+)$ ]]; then
+            TAG_NAME="${BASH_REMATCH[1]}"
+            echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+            echo "Tag name: $TAG_NAME"
+          else
+            echo "Error: GITHUB_REF is not a tag: $GITHUB_REF"
+            exit 1
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/openocd-linux-x86_64/openocd-linux-x86_64.tar.gz
+            artifacts/openocd-linux-x86_64/openocd-linux-x86_64.tar.gz.sha256
+            artifacts/openocd-windows-i686/openocd-windows-i686.zip
+            artifacts/openocd-windows-i686/openocd-windows-i686.zip.sha256
+            artifacts/openocd-macos-arm64/openocd-macos-arm64.tar.gz
+            artifacts/openocd-macos-arm64/openocd-macos-arm64.tar.gz.sha256
+            artifacts/openocd-macos-x86_64/openocd-macos-x86_64.tar.gz
+            artifacts/openocd-macos-x86_64/openocd-macos-x86_64.tar.gz.sha256
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Release ${{ steps.tag.outputs.tag }}
+          body: |
+            OpenOCD binaries for HPMicro MCUs.
+
+            ## System requirements
+
+            - Linux: glibc >= 2.36 (Debian 12+, Ubuntu 24.04+)
+            - macOS: 11.0 or newer (separate arm64 and x86_64 packages)
+            - Windows: 10/11 (32-bit binary, runs on x64 via WoW64)
+
+            Probe support libraries (libusb, hidapi, and on Windows also
+            capstone and jimtcl) are linked statically. Linux builds
+            additionally require libudev (part of systemd, present on all
+            mainstream distributions).
+
+            ## Driver notes (Windows)
+
+            - FT2232-based probes ship with the FTDI VCP/D2XX driver bound
+              by default; replace it with WinUSB (e.g. using Zadig) before
+              use, otherwise the probe will not be listed.
+            - CMSIS-DAP v2 probes usually bind WinUSB automatically via
+              Microsoft OS descriptors. CMSIS-DAP v1 (HID) probes need no
+              driver installation.
+          generate_release_notes: true
+          draft: false
+          prerelease: false
